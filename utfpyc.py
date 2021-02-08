@@ -57,7 +57,8 @@ class u8char(int):
         return self.type == U8.start4
 
 
-def invalid(bytestring):
+def invalidu32(num):
+    bytestring = struct.pack('<I', num)
     try:
         bytestring.decode()
     except UnicodeDecodeError:
@@ -65,110 +66,167 @@ def invalid(bytestring):
     return False
 
 
+def maybe_bigger(num):
+    while invalidu32(num):
+        num += 1
+    return num
+
+
 ANY_ASCII = ord('S')
+empty_instr = dis.Instruction(
+    opname=None, opcode=None, arg=None, argval=None, argrepr=None,
+    offset=None, starts_line=None, is_jump_target=None)
 
 
-def transcode(codeobj, force=False, verbose=False):
-    places = {}
-    newcode = []
+class Transcoder:
+    def __init__(self, codeobj, force=False, verbose=False):
+        self.bcode = dis.Bytecode(codeobj)
+        self.places = {}
+        self.newcode = []
+        self.codeobj = codeobj
+        self.force = force
+        self.verbose = verbose
+        self.state = U8.ascii
+        self.was_extended_arg = False
+        self.nextcode = list(self.bcode)[1:]
 
-    bcode = dis.Bytecode(codeobj)
-    nextcode = iter(bcode)
-    next(nextcode)
+    def maybe_insert_cont(self):
+        if self.was_extended_arg:
+            print('Warn: insert after ext arg would change semantics (1)')
+        if self.state == U8.start2:
+            self.newcode.extend((dis.EXTENDED_ARG, 0))
+            self.state = U8.ascii
+        if self.state == U8.start3:
+            self.newcode.extend((dis.EXTENDED_ARG, 0x80))
+            self.state = U8.cont
+            self.need_ignore = True
+        if self.state == U8.start4:
+            self.newcode.extend((dis.EXTENDED_ARG, 0x80,
+                                 dis.EXTENDED_ARG, 0))
+            self.state = U8.ascii
+            self.need_ignore = True
 
-    state = U8.ascii
-    for x, nextx in zip_longest(bcode, nextcode):
-        startlen = len(newcode)
+    def maybe_insert_start(self, val):
+        if self.newcode[-1:] == [None]:
+            self.newcode[-1] = val
+        elif self.was_extended_arg:
+            print('Warn: insert after ext arg would change semantics (2)')
+            val = 0
+        else:
+            self.newcode.extend((dis.opmap['NOP'], val))
+            self.need_ignore = False
+        self.state = u8char(val).type
 
-        if not nextx:
-            nextx = dis.Instruction(opname=None, opcode=None, arg=None, argval=None, argrepr=None, offset=None, starts_line=None, is_jump_target=None)
+    def process(self, x, nextx):
+        startlen = len(self.newcode)
 
-        opcode, arg, nextopcode, nextarg = map(u8char,
-            (x.opcode, x.arg, nextx.opcode, nextx.arg))
+        opcode, arg, nextopcode, nextarg = map(
+            u8char,
+            (x.opcode, x.arg, nextx.opcode, nextx.arg)
+        )
 
-        need_close = (   state >= U8.start2 and not opcode.cont
-                      or state >= U8.start3 and not arg.cont
-                      or state == U8.start2 and arg.cont)
-        need_ignore = False
+        need_close = (self.state >= U8.start2 and not opcode.cont
+                      or self.state >= U8.start3 and not arg.cont
+                      or self.state == U8.start2 and arg.cont)
+        self.need_ignore = False
 
-        if verbose > 2:
-            print(f'{x=}, {state=}, {need_close=}')
-        if need_close and state >= U8.start2:
-            if state == U8.start2:
-                newcode.extend((dis.EXTENDED_ARG, 0))
-                state = U8.ascii
-            elif state == U8.start3:
-                newcode.extend((dis.EXTENDED_ARG, 0x80))
-                need_ignore = True
-                state = U8.cont
-            elif state == U8.start4:
-                newcode.extend((dis.EXTENDED_ARG, 0x80, dis.EXTENDED_ARG, 0))
-                need_ignore = True
-                state = U8.ascii
+        if self.verbose > 2:
+            print(f'{x=}, {self.state=}, {need_close=}')
 
-        if opcode.cont and state < U8.start2:  # thankfully all opcodes are currently < 0xc0
+        if need_close and self.state >= U8.start2:
+            self.maybe_insert_cont()
+
+        # thankfully all opcodes are currently < 0xc0
+        if opcode.cont and self.state < U8.start2:
             val = 0xc3
             if arg.cont:
                 val = 0xe1  # escape arg as well
                 if nextopcode.cont and not nextarg.cont:
                     val = 0xf1  # escape next opcode as well
-            if newcode[-1:] == [None]:
-                newcode[-1] = val
-            else:
-                newcode.extend((dis.opmap['NOP'], val))
-                need_ignore = False
-            state = u8char(val).type
+            self.maybe_insert_start(val)
 
-        if need_ignore and x.opcode >= dis.HAVE_ARGUMENT:
-            newcode.extend((dis.opmap['NOP'], None))
+        if self.need_ignore and x.opcode >= dis.HAVE_ARGUMENT:
+            self.newcode.extend((dis.opmap['NOP'], None))
 
-        if newcode[-1:] == [None]:
-            newcode[-1] = ANY_ASCII
+        if self.newcode[-1:] == [None]:
+            self.newcode[-1] = ANY_ASCII
 
-        places[x.offset] = startlen, len(newcode)
-        newcode.extend((x.opcode, x.arg))
+        self.places[x.offset] = startlen, len(self.newcode)
+        self.newcode.extend((x.opcode, x.arg))
+
+        self.was_extended_arg = opcode == dis.EXTENDED_ARG
 
         if not arg:
-            state = U8.ascii
+            self.state = U8.ascii
         elif arg.start:
-            state = arg.type
+            self.state = arg.type
         elif opcode.start:  # impossible
-            state = opcode.type - 1
-        elif state >= U8.start2:
-            state -= 2
+            self.state = opcode.type - 1
+        elif self.state >= U8.start2:
+            self.state -= 2
 
-    if newcode[-1:] == [None]:
-        newcode[-1] = ANY_ASCII
+    def adjumps(self):
+        for x in self.bcode:
+            if x.opcode in dis.hasjrel or x.opcode in dis.hasjabs:
+                _, pl = self.places[x.offset]
+                vmin, vmax = self.places[x.argval]
+                if x.opcode in dis.hasjrel:
+                    vmin -= pl + 2
+                    vmax -= pl + 2
+                if x.arg < vmin:
+                    v = vmin
+                elif x.arg > vmax:
+                    v = vmax
+                else:
+                    continue
 
-    for x in bcode:
-        if x.opcode in dis.hasjrel or x.opcode in dis.hasjabs:
-            _, pl = places[x.offset]
-            vmin, vmax = places[x.argval]
-            if x.opcode in dis.hasjrel:
-                vmin -= pl + 2
-                vmax -= pl + 2
-            newcode[pl + 1] = vmin
+                oldrep = x.arg.to_bytes(4, 'little')
+                newrep = v.to_bytes(4, 'little')
+                while True:
+                    self.newcode[pl + 1] = newrep[0]
+                    oldrep = oldrep[1:]
+                    newrep = newrep[1:]
+                    if oldrep == newrep:
+                        break
+                    if not any(oldrep):
+                        print('does not converge! try to tweak '
+                              f'{self.codeobj.co_name} in '
+                              f'{self.codeobj.co_filename}'
+                              f':{self.codeobj.co_firstlineno}')
+                        break
+                    pl -= 2
+                    assert self.newcode[pl] == dis.EXTENDED_ARG
 
-    # adjust code length
-    while invalid(struct.pack('<I', len(newcode))):
-        newcode.append(ANY_ASCII)
-    newcode = bytes(newcode)
+    def transcode(self):
+        for x, nextx in zip_longest(self.bcode, self.nextcode,
+                                    fillvalue=empty_instr):
+            self.process(x, nextx)
 
-    # adjust stacksize
-    co_stacksize = codeobj.co_stacksize
-    while invalid(struct.pack('<I', co_stacksize)):
-        co_stacksize += 1
+        if self.newcode[-1:] == [None]:
+            self.newcode[-1] = ANY_ASCII
 
-    codeobj = codeobj.replace(co_code=newcode, co_lnotab=b'', co_stacksize=co_stacksize)
-    if verbose:
-        if verbose > 1:
-            dis.dis(codeobj)
-        print(repr(newcode))
-        print(repr(newcode.decode()))
+        self.adjumps()
 
-    assert force or newcode.decode()  # make sure UTF-8 magic really worked
+        # adjust code length
+        while invalidu32(len(self.newcode)):
+            self.newcode.append(ANY_ASCII)
+        newcode = bytes(self.newcode)
 
-    return codeobj
+        # adjust stacksize
+        co_stacksize = maybe_bigger(self.codeobj.co_stacksize)
+
+        codeobj = self.codeobj.replace(co_code=newcode, co_lnotab=b'',
+                                       co_stacksize=co_stacksize)
+        if self.verbose:
+            if self.verbose > 1:
+                dis.dis(codeobj)
+            print(repr(newcode))
+            print(repr(newcode.decode()))
+
+        # make sure UTF-8 magic really worked
+        assert self.force or newcode.decode()
+
+        return codeobj
 
 
 class NorefMarshalDumper:
@@ -188,6 +246,9 @@ class NorefMarshalDumper:
     def u32(self, i):
         self.write(struct.pack('<I', i))
 
+    def s32(self, i):
+        self.write(struct.pack('<i', i))
+
     def u8(self, i):
         self.write(struct.pack('<B', i))
 
@@ -204,7 +265,7 @@ class NorefMarshalDumper:
 
     def dump_int(self, i):
         self.fp.write(b'i')
-        self.u32(i)
+        self.s32(i)
 
     def dump_str(self, s):
         self.fp.write(b'z')
@@ -220,11 +281,11 @@ class NorefMarshalDumper:
         self.fp.write(b')')
         self.u8(len(t))
         for x in t:
-          self.dump(x)
+            self.dump(x)
 
     def dump_code(self, co):
         self.fp.write(b'c')
-        co = transcode(co, self.force, self.verbose)
+        co = Transcoder(co, self.force, self.verbose).transcode()
         self.u32(co.co_argcount)
         self.u32(co.co_posonlyargcount)
         self.u32(co.co_kwonlyargcount)
@@ -247,10 +308,13 @@ def main():
     import argparse
 
     par = argparse.ArgumentParser()
-    par.add_argument('--filename', help='set alternate co_filename', default=None)
-    par.add_argument('--mode', help='set alternate compile mode', default='exec', choices=['single', 'exec'])
+    par.add_argument('--filename', default=None,
+                     help='set alternate co_filename')
+    par.add_argument('--mode', default='exec', choices=['single', 'exec'],
+                     help='set alternate compile mode')
     par.add_argument('-v', '--verbose', default=0, action='count')
-    par.add_argument('-f', '--force', action='store_true', help='force write even if UTF-8 cannot be fully acheived')
+    par.add_argument('-f', '--force', action='store_true',
+                     help='force write even if UTF-8 cannot be fully acheived')
     par.add_argument('infile', type=argparse.FileType('rb'))
     par.add_argument('outfile', type=argparse.FileType('wb'))
 
@@ -258,6 +322,7 @@ def main():
 
     if args.filename is None:
         args.filename = os.path.abspath(args.infile.name)
+
     with args.infile as fp:
         codeobj = compile(fp.read(), args.filename, args.mode)
 
@@ -268,6 +333,7 @@ def main():
         # like marshal.dump(codeobj, fp), but no remembering and references;
         # it also fixes up code whenever it can be made more UTF-8 valid
         NorefMarshalDumper(fp, args.force, args.verbose).dump(codeobj)
+
 
 if __name__ == "__main__":
     main()
