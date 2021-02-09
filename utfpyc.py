@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# utfpyc.py - routines for building valid UTF-8 CPython bytecode
+# Copyright (C) 2021  Arusekk
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+__version__ = '1.0'
+
 
 import dis
 import os
@@ -359,6 +377,8 @@ def main():
     par.add_argument('-v', '--verbose', default=0, action='count')
     par.add_argument('-f', '--force', action='store_true',
                      help='force write even if UTF-8 cannot be fully acheived')
+    par.add_argument('--version', action='version',
+                     version='%(prog)s {}'.format(__version__))
     par.add_argument('infile', type=argparse.FileType('rb'))
     par.add_argument('outfile', type=argparse.FileType('wb'))
 
