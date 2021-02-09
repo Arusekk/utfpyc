@@ -59,6 +59,9 @@ class Transcoder:
         self.state = U8.ascii
         self.was_extended_arg = False
         self.nextcode = list(self.bcode)[1:]
+        self.lnotab = bytearray()
+        self.lineno = codeobj.co_firstlineno
+        self.index = 0
 
     def maybe_insert_cont(self):
         if self.was_extended_arg:
@@ -121,6 +124,8 @@ class Transcoder:
             self.maybe_insert_start(val, x)
 
         if self.need_ignore and opcode >= dis.HAVE_ARGUMENT:
+            if self.newcode[-1] is None:
+                self.newcode[-1] = ANY_ASCII
             self.newcode.extend((dis.opmap['NOP'], None))
 
         if self.newcode[-1:] == [None]:
@@ -183,10 +188,30 @@ class Transcoder:
             if x.opcode in dis.hasjrel or x.opcode in dis.hasjabs:
                 self.fixjump(x)
 
+    def record_lineno(self, lineno):
+        index = len(self.newcode)
+        if lineno is None or lineno == self.lineno or index == self.index:
+            return
+        lineinc = lineno - self.lineno
+        idxinc = index - self.index
+        if lineinc < 0:
+            # negative line number deltas result in invalid utf-8
+            return
+        while lineinc > 127:
+            self.lnotab.extend((0, 127))
+            lineinc -= 127
+        while idxinc > 127:
+            self.lnotab.extend((127, 0))
+            idxinc -= 127
+        self.lnotab.extend((idxinc, lineinc))
+        self.index = index
+        self.lineno = lineno
+
     def transcode(self, can_recurse=False):
         for x, nextx in zip_longest(self.bcode, self.nextcode,
                                     fillvalue=empty_instr):
             minoff = len(self.newcode)
+            self.record_lineno(x.starts_line)
             if x.opcode != dis.EXTENDED_ARG:
                 self.process(x, nextx)
             maxoff = len(self.newcode)
@@ -207,7 +232,8 @@ class Transcoder:
                 if self.verbose > 1:
                     hexdump(self.newcode)
             return Transcoder(
-                CodeWrapper(self.codeobj, co_code=self.newcode),
+                CodeWrapper(self.codeobj, co_code=self.newcode,
+                            co_lnotab=self.lnotab),
                 self.force,
                 self.verbose).transcode(can_recurse - 1)
 
@@ -219,7 +245,8 @@ class Transcoder:
         # adjust stacksize
         co_stacksize = maybe_bigger(self.codeobj.co_stacksize)
 
-        codeobj = self.codeobj.replace(co_code=newcode, co_lnotab=b'',
+        codeobj = self.codeobj.replace(co_code=newcode,
+                                       co_lnotab=bytes(self.lnotab),
                                        co_stacksize=co_stacksize)
         if self.verbose:
             if self.verbose > 1:
@@ -247,10 +274,11 @@ class NorefMarshalDumper:
         ...: b'.',
     }
 
-    def __init__(self, fp, force=False, verbose=0):
+    def __init__(self, fp, force=False, write_lnotab=True, verbose=0):
         self.fp = fp
         self.verbose = verbose
         self.force = force
+        self.write_lnotab = write_lnotab
 
     def u32(self, i):
         self.write(struct.pack('<I', i))
@@ -277,8 +305,12 @@ class NorefMarshalDumper:
         self.s32(i)
 
     def dump_str(self, s):
-        self.fp.write(b'z')
-        self.u8(len(s))
+        if len(s) < 0x80:
+            self.fp.write(b'z')
+            self.u8(len(s))
+        else:
+            self.fp.write(b'a')
+            self.u32(len(s))
         self.fp.write(s.encode())
 
     def dump_bytes(self, b):
@@ -310,7 +342,7 @@ class NorefMarshalDumper:
         self.dump(co.co_filename)
         self.dump(co.co_name)
         self.u32(co.co_firstlineno)
-        self.dump(co.co_lnotab)
+        self.dump(self.write_lnotab and co.co_lnotab or b'')
 
 
 def main():
@@ -321,6 +353,9 @@ def main():
                      help='set alternate co_filename')
     par.add_argument('--mode', default='exec', choices=['single', 'exec'],
                      help='set alternate compile mode')
+    par.add_argument('--no-lnotab', action='store_false', dest='lnotab',
+                     help='reduce the output size by dropping '
+                          'line number information')
     par.add_argument('-v', '--verbose', default=0, action='count')
     par.add_argument('-f', '--force', action='store_true',
                      help='force write even if UTF-8 cannot be fully acheived')
@@ -341,7 +376,8 @@ def main():
         fp.seek(16)
         # like marshal.dump(codeobj, fp), but no remembering and references;
         # it also fixes up code whenever it can be made more UTF-8 valid
-        NorefMarshalDumper(fp, args.force, args.verbose).dump(codeobj)
+        NorefMarshalDumper(fp, args.force, args.lnotab,
+                           args.verbose).dump(codeobj)
 
 
 if __name__ == "__main__":

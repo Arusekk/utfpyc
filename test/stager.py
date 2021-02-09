@@ -1,28 +1,3 @@
-# UTFPYC
-
-Why not make .pyc files that are valid UTF-8 by the way?
-
-Note: this only works best-effort and assumes you don't use
-constants and literals that are not possible to encode this way.
-It just makes sure that the code for code objects is a little better,
-while longer and hopefully not changing its semantics.
-
-The code here is intended for use with CPython 3.9,
-but should work with CPython 3.8-3.11 with no changes,
-and with older wordcode CPythons just by tweaking the marshaller.
-
-If necessary, it may be rewritten using the excellent [xdis] library.
-
-[xdis]: https://github.com/rocky/python-xdis
-
-Note that in most cases you should not need to transform very complex
-code patterns using this project,
-and whenever it fails to do its job on your actual payload
-you can just compile a stager with it,
-and embed your actual payload inside in some way.
-
-Example stager for the simple case [`test/stager.py`](test/stager.py):
-```py
 import binascii
 import marshal
 
@@ -62,4 +37,3 @@ actual_payload = '''
 535353535353
 '''.replace('\n', '') # hexlified PYC file, padded to encodable length
 eval(marshal.loads(binascii.unhexlify(actual_payload)[16:]))
-```
